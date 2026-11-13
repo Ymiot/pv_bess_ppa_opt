@@ -331,7 +331,7 @@ def plot_deterministic_benchmark_2020_2022(
     months = np.arange(1, 13)
     month_labels = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
-    ppa_profiles = ["24/7", "08h-20h", "12h-20h"]
+    ppa_profiles = ["24/7", "08h-20h", "12h-00h"]
     regimes = ["2020_Cannibalization", "2022_Energy_Crisis"]
     df_shapes = pd.DataFrame(monthly_shapes_records)
 
