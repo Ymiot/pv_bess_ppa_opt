@@ -11,57 +11,57 @@ with open(project_root / "data" / "config" / "project_params.yml", "r") as f:
 import numpy as np
 import pandas as pd
 from src.data_loader import load_or_download_year_data
-from src.stochastic_ems import solve_annual_monthly_baseload_52w
+from src.stochastic_ems import solve_full_year_8760h_coopt
 from src.finance import evaluate_project_finance
 from src.plotting import plot_deterministic_benchmark_2020_2022
 
 def main():
     sim_name = "deterministic_benchmark_2020_2022"
     pv_mwp = float(cfg["project"]["pv_capacity_mwp"])
-    bess_p = float(cfg["bess_default"]["power_mw"])
-    bess_e = float(cfg["bess_default"]["energy_mwh"])
 
+    # 1. Load 8760-hour historical datasets for 2020 and 2022
     df_2020 = load_or_download_year_data(2020, project_root, pv_capacity_mwp=pv_mwp, area="DK1")
     df_2022 = load_or_download_year_data(2022, project_root, pv_capacity_mwp=pv_mwp, area="DK1")
 
     det_years = {
-        "2020_Cannibalization": {"Y2020": df_2020},
-        "2022_Energy_Crisis": {"Y2022": df_2022},
+        "2020_Cannibalization": df_2020,
+        "2022_Energy_Crisis": df_2022,
     }
 
-    profiles = ["Merchant_Only", "08h-20h", "24/7"]
+    profiles = ["Merchant_Only", "24/7", "08h-20h", "12h-00h"]
     allowance_pcts = [0.00, 0.05, 0.10, 0.15]
 
-    rows = []
-    monthly_shapes = {}
-    learned_2020_contracts = {}
-    oracle_2022_revs = {}
+    in_sample_rows = []
+    monthly_shapes_records = []
+    learned_designs = {}  # Stores {(yr_name, profile, allow_pct): full result dict}
 
-    for yr_name, scen_dict in det_years.items():
-        print(f"\n================ DETERMINISTIC PERFECT FORESIGHT: {yr_name} ================")
+    # =========================================================================
+    # STEP 1: IN-SAMPLE PERFECT FORESIGHT CO-OPTIMIZATION (BESS MW/MWh + 12 B_m)
+    # =========================================================================
+    for yr_name, df_yr in det_years.items():
+        print(f"\n================ IN-SAMPLE CO-OPTIMIZATION (BESS + 12 MONTHLY BL): {yr_name} ================")
         for profile in profiles:
             pct_list = [0.0] if profile == "Merchant_Only" else allowance_pcts
             for allow_pct in pct_list:
-                res = solve_annual_monthly_baseload_52w(
-                    yearly_scenarios_df=scen_dict,
+                res = solve_full_year_8760h_coopt(
+                    df_year=df_yr,
                     cfg=cfg,
                     allowance_pct=allow_pct,
                     contract_profile=profile,
-                    bess_power_mw=bess_p,
-                    bess_energy_mwh=bess_e,
-                    use_fast_lp=True,
+                    optimize_bess_size=True,  # Co-optimizes BESS Power (MW) & Storage (MWh) + 12 B_m!
                 )
                 fin = evaluate_project_finance(
-                    bankable_ppa_revenue_eur=res["Realized_or_Mean_Bankable_MEUR"] * 1e6,
-                    merchant_bonus_revenue_eur=res["Realized_or_Mean_Merchant_MEUR"] * 1e6,
+                    bankable_ppa_revenue_eur=res["Realized_Bankable_MEUR"] * 1e6,
+                    merchant_bonus_revenue_eur=res["Realized_Merchant_MEUR"] * 1e6,
                     pv_mw=pv_mwp,
-                    bess_power_mw=bess_p,
-                    bess_energy_mwh=bess_e,
+                    bess_power_mw=res["Optimal_BESS_Power_MW"],
+                    bess_energy_mwh=res["Optimal_BESS_Energy_MWh"],
                     cfg=cfg,
                 )
 
-                # Store strictly deterministic metrics (no P50/P90/CVaR columns!)
-                rows.append({
+                learned_designs[(yr_name, profile, allow_pct)] = {**res, **fin}
+
+                row = {
                     "Year_Regime": yr_name,
                     "Contract_Profile": profile,
                     "Allowance_Pct": allow_pct * 100.0,
@@ -69,9 +69,13 @@ def main():
                     "Mean_Annual_Baseload_MW": res["Mean_Annual_Baseload_MW"],
                     "Min_Winter_Baseload_MW": res["Min_Winter_Baseload_MW"],
                     "Max_Summer_Baseload_MW": res["Max_Summer_Baseload_MW"],
+                    "Optimal_BESS_Power_MW": res["Optimal_BESS_Power_MW"],
+                    "Optimal_BESS_Energy_MWh": res["Optimal_BESS_Energy_MWh"],
                     "Annual_BESS_Cycles": res["Annual_BESS_Cycles"],
                     "Annual_Avoided_Penalty_MEUR": res["Annual_Avoided_Penalty_MEUR"],
-                    "Annual_Paid_Penalty_MEUR": res["Annual_Expected_Penalty_MEUR"],
+                    "Annual_Paid_Penalty_MEUR": res["Annual_Paid_Penalty_MEUR"],
+                    "CAPEX_Total_MEUR": fin["CAPEX_Total_MEUR"],
+                    "CAPEX_BESS_MEUR": fin["CAPEX_BESS_MEUR"],
                     "Bankable_PPA_Rev_MEUR": fin["Bankable_PPA_Rev_MEUR"],
                     "Merchant_Bonus_Rev_MEUR": fin["Merchant_Bonus_Rev_MEUR"],
                     "Total_Rev_MEUR": fin["Total_Rev_MEUR"],
@@ -79,64 +83,111 @@ def main():
                     "IRR_Bankable_pct": fin["IRR_Bankable_pct"],
                     "NPV_Total_MEUR": fin["NPV_Total_MEUR"],
                     "IRR_Total_pct": fin["IRR_Total_pct"],
+                }
+                in_sample_rows.append(row)
+
+                if profile != "Merchant_Only":
+                    for m_idx, bl_mw in res["Monthly_Baseload_Profile_MW"].items():
+                        monthly_shapes_records.append({
+                            "Year_Regime": yr_name,
+                            "Contract_Profile": profile,
+                            "Allowance_Pct": allow_pct * 100.0,
+                            "Month": m_idx,
+                            "Baseload_MW": bl_mw,
+                        })
+
+                print(
+                    f"[{profile:13s} | Allow {allow_pct*100:2.0f}%] "
+                    f"Mean BL: {res['Mean_Annual_Baseload_MW']:4.1f}MW | "
+                    f"BESS: {res['Optimal_BESS_Power_MW']:4.1f}MW / {res['Optimal_BESS_Energy_MWh']:5.1f}MWh ({res['Annual_BESS_Cycles']:3.0f} cyc) | "
+                    f"PPA Rev: {fin['Bankable_PPA_Rev_MEUR']:5.2f}M€ | "
+                    f"Bonus: {fin['Merchant_Bonus_Rev_MEUR']:5.2f}M€ | "
+                    f"IRR Bank/Tot: {fin['IRR_Bankable_pct']:6.2f}% / {fin['IRR_Total_pct']:5.2f}%"
+                )
+
+    # =========================================================================
+    # STEP 2: CROSS-SCENARIO OUT-OF-SAMPLE EVALUATION FOR ALL COMBINATIONS
+    # (1) Trained on 2020 -> Tested on 2022
+    # (2) Trained on 2022 -> Tested on 2020
+    # =========================================================================
+    cross_pairs = [
+        ("2020_Cannibalization", "2022_Energy_Crisis", df_2022, "Trained_2020_Tested_in_2022"),
+        ("2022_Energy_Crisis", "2020_Cannibalization", df_2020, "Trained_2022_Tested_in_2020"),
+    ]
+
+    cross_rows = []
+    for train_yr, test_yr, df_test, dir_label in cross_pairs:
+        print(f"\n================ CROSS-EVALUATION: {dir_label} ================")
+        for profile in profiles:
+            pct_list = [0.0] if profile == "Merchant_Only" else allowance_pcts
+            for allow_pct in pct_list:
+                design_train = learned_designs[(train_yr, profile, allow_pct)]
+                native_oracle = learned_designs[(test_yr, profile, allow_pct)]
+
+                # Solve deterministic dispatch on `df_test` with BESS & Monthly Baseloads fixed from `train_yr`
+                res_oos = solve_full_year_8760h_coopt(
+                    df_year=df_test,
+                    cfg=cfg,
+                    allowance_pct=allow_pct,
+                    contract_profile=profile,
+                    optimize_bess_size=False,
+                    fixed_bess_power_mw=design_train["Optimal_BESS_Power_MW"],
+                    fixed_bess_energy_mwh=design_train["Optimal_BESS_Energy_MWh"],
+                    fixed_monthly_baseloads=design_train["Monthly_Baseload_Profile_MW"],
+                )
+
+                fin_oos = evaluate_project_finance(
+                    bankable_ppa_revenue_eur=res_oos["Realized_Bankable_MEUR"] * 1e6,
+                    merchant_bonus_revenue_eur=res_oos["Realized_Merchant_MEUR"] * 1e6,
+                    pv_mw=pv_mwp,
+                    bess_power_mw=design_train["Optimal_BESS_Power_MW"],
+                    bess_energy_mwh=design_train["Optimal_BESS_Energy_MWh"],
+                    cfg=cfg,
+                )
+
+                cross_rows.append({
+                    "Evaluation_Direction": dir_label,
+                    "Trained_On": train_yr,
+                    "Tested_On": test_yr,
+                    "Contract_Profile": profile,
+                    "Allowance_Pct": allow_pct * 100.0,
+                    "Fixed_Mean_Baseload_MW": design_train["Mean_Annual_Baseload_MW"],
+                    "Fixed_BESS_Power_MW": design_train["Optimal_BESS_Power_MW"],
+                    "Fixed_BESS_Energy_MWh": design_train["Optimal_BESS_Energy_MWh"],
+                    "OOS_Paid_Penalty_MEUR": res_oos["Annual_Paid_Penalty_MEUR"],
+                    "OOS_Avoided_Penalty_MEUR": res_oos["Annual_Avoided_Penalty_MEUR"],
+                    "OOS_Bankable_PPA_Rev_MEUR": fin_oos["Bankable_PPA_Rev_MEUR"],
+                    "OOS_Merchant_Bonus_Rev_MEUR": fin_oos["Merchant_Bonus_Rev_MEUR"],
+                    "OOS_Total_Rev_MEUR": fin_oos["Total_Rev_MEUR"],
+                    "OOS_IRR_Bankable_pct": fin_oos["IRR_Bankable_pct"],
+                    "OOS_IRR_Total_pct": fin_oos["IRR_Total_pct"],
+                    "Native_Oracle_Bankable_Rev_MEUR": native_oracle["Bankable_PPA_Rev_MEUR"],
+                    "Native_Oracle_IRR_Bankable_pct": native_oracle["IRR_Bankable_pct"],
+                    "Native_Oracle_IRR_Total_pct": native_oracle["IRR_Total_pct"],
                 })
 
                 print(
                     f"[{profile:13s} | Allow {allow_pct*100:2.0f}%] "
-                    f"BL: {res['Mean_Annual_Baseload_MW']:4.1f}MW | "
-                    f"Cycles: {res['Annual_BESS_Cycles']:3.0f}/yr | "
-                    f"PPA Rev: {fin['Bankable_PPA_Rev_MEUR']:5.2f}M€ | "
-                    f"Spot Bonus: {fin['Merchant_Bonus_Rev_MEUR']:5.2f}M€ | "
-                    f"IRR Bank/Tot: {fin['IRR_Bankable_pct']:6.2f}% / {fin['IRR_Total_pct']:5.2f}%"
+                    f"Fixed BL: {design_train['Mean_Annual_Baseload_MW']:4.1f}MW & BESS: {design_train['Optimal_BESS_Energy_MWh']:5.1f}MWh | "
+                    f"OOS PPA Rev: {fin_oos['Bankable_PPA_Rev_MEUR']:6.2f}M€ (Pen: {res_oos['Annual_Paid_Penalty_MEUR']:5.2f}M€) | "
+                    f"OOS IRR Tot: {fin_oos['IRR_Total_pct']:6.2f}% vs Oracle: {native_oracle['IRR_Total_pct']:5.2f}%"
                 )
 
-                if profile == "08h-20h" and allow_pct in [0.0, 0.10]:
-                    monthly_shapes[f"{yr_name} (08h-20h, {int(allow_pct*100)}% Allow)"] = res["Monthly_Baseload_Profile_MW"]
+    # =========================================================================
+    # STEP 3: SAVE ALL PLOTS AND CSV TABLES
+    # =========================================================================
+    df_det = pd.DataFrame(in_sample_rows)
+    df_cross = pd.DataFrame(cross_rows)
 
-                if profile == "08h-20h":
-                    if yr_name == "2020_Cannibalization":
-                        learned_2020_contracts[allow_pct] = res["Monthly_Baseload_Profile_MW"]
-                    else:
-                        oracle_2022_revs[allow_pct] = fin["Bankable_PPA_Rev_MEUR"]
+    plot_deterministic_benchmark_2020_2022(df_det, monthly_shapes_records, df_cross, test_name=sim_name)
 
-    # Out-of-Sample Stress Test: What happens when the aggressive 2020 contract faces the 2022 Crisis?
-    print("\n================ OUT-OF-SAMPLE CRASH TEST (2020 CONTRACT IN 2022 CRISIS) ================")
-    oos_rows = []
-    for allow_pct in allowance_pcts:
-        res_oos = solve_annual_monthly_baseload_52w(
-            yearly_scenarios_df={"Y2022": df_2022},
-            cfg=cfg,
-            allowance_pct=allow_pct,
-            contract_profile="08h-20h",
-            bess_power_mw=bess_p,
-            bess_energy_mwh=bess_e,
-            fixed_monthly_baseloads=learned_2020_contracts[allow_pct],
-            use_fast_lp=True,
-        )
-        print(
-            f"Allow {allow_pct*100:2.0f}% | Naive 2020 Contract in 2022 -> "
-            f"Net PPA Rev: {res_oos['Realized_or_Mean_Bankable_MEUR']:6.2f} M€ "
-            f"(Paid Penalties: {res_oos['Annual_Expected_Penalty_MEUR']:5.2f} M€) vs 2022 Oracle: {oracle_2022_revs[allow_pct]:5.2f} M€"
-        )
-        oos_rows.append({
-            "Allowance_Pct": f"{int(allow_pct*100)}%",
-            "Contract_Strategy": "Naive 2020 Contract (Tested in 2022)",
-            "Realized_Bankable_MEUR": res_oos["Realized_or_Mean_Bankable_MEUR"],
-        })
-        oos_rows.append({
-            "Allowance_Pct": f"{int(allow_pct*100)}%",
-            "Contract_Strategy": "2022 Perfect Foresight Oracle",
-            "Realized_Bankable_MEUR": oracle_2022_revs[allow_pct],
-        })
+    out_dir = project_root / "plots" / sim_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    df_det.to_csv(out_dir / "deterministic_in_sample_summary.csv", index=False)
+    df_cross.to_csv(out_dir / "deterministic_cross_scenario_oos.csv", index=False)
+    pd.DataFrame(monthly_shapes_records).to_csv(out_dir / "deterministic_monthly_baseload_shapes.csv", index=False)
 
-    df_det = pd.DataFrame(rows)
-    df_oos = pd.DataFrame(oos_rows)
-    plot_deterministic_benchmark_2020_2022(df_det, monthly_shapes, df_oos, test_name=sim_name)
-
-    csv_path = project_root / "plots" / sim_name / "deterministic_benchmark_summary.csv"
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    df_det.to_csv(csv_path, index=False)
-    print(f"\nAll Deterministic Benchmark plots & CSV saved in: plots/{sim_name}/")
+    print(f"\nDone! All 4 deterministic plot suites and 3 CSV tables saved in: {out_dir}")
 
 if __name__ == "__main__":
     main()

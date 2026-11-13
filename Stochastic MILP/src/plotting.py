@@ -316,180 +316,164 @@ def plot_backtest_2020_vs_2022(df_backtest: pd.DataFrame, monthly_shapes: dict, 
 
 def plot_deterministic_benchmark_2020_2022(
     df_det: pd.DataFrame,
-    monthly_shapes: dict,
-    df_oos_crash: pd.DataFrame,
+    monthly_shapes_records: list,
+    df_cross: pd.DataFrame,
     test_name: str
 ):
     """
-    Plots for Script 1 (`deterministic_benchmark_2020_2022`):
-    No P50/P90/CVaR jargon here — strictly Deterministic Perfect Foresight vs Out-of-Sample Crash Test!
+    Generates 4 publication-grade figure suites for the Deterministic Benchmark (2020 vs 2022):
+    1. Monthly Baseload profiles (Jan-Dec) for all profiles (24/7, 08h-20h, 12h-20h) & allowances (0, 5, 10, 15%).
+    2. Bankable IRR vs Total IRR (+ Merchant Bonus) and Merchant_Only benchmark.
+    3. Co-optimized BESS Power (MW), Storage Capacity (MWh), and Annual Cycling.
+    4. Full Cross-Scenario Out-of-Sample Matrix (2020 models tested on 2022 & 2022 models tested on 2020).
     """
     plot_dir = _get_plot_dir(test_name)
     months = np.arange(1, 13)
     month_labels = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
-    # --- PLOT 1: 4-Panel Deterministic Overview ---
-    fig, axs = plt.subplots(2, 2, figsize=(16, 11))
-    fig.suptitle("Deterministic Benchmark (Perfect Foresight): 2020 (Cannibalization) vs 2022 (Energy Crisis)", fontsize=15, fontweight="bold")
+    ppa_profiles = ["24/7", "08h-20h", "12h-20h"]
+    regimes = ["2020_Cannibalization", "2022_Energy_Crisis"]
+    df_shapes = pd.DataFrame(monthly_shapes_records)
 
-    # 1. Seasonal Baseload Shaping B_m (2020 vs 2022)
-    for label, shape_dict in monthly_shapes.items():
-        axs[0, 0].plot(months, [shape_dict[m] for m in months], marker="o", linewidth=2.2, label=label)
-    axs[0, 0].set_xticks(months)
-    axs[0, 0].set_xticklabels(month_labels)
-    axs[0, 0].set_title("1. Perfect Foresight Monthly Baseload Shaping (MW)")
-    axs[0, 0].set_ylabel("Promised Monthly Baseload B_m (MW)")
-    axs[0, 0].legend(fontsize=8.5)
+    # =========================================================================
+    # PLOT 1: 2x3 Grid of Monthly Baseload Profiles (Jan-Dec) for All Models
+    # =========================================================================
+    fig1, axs1 = plt.subplots(2, 3, figsize=(19, 10), sharey=True)
+    fig1.suptitle(
+        "Optimal Monthly Baseload Profiles B_m (Jan - Dec) Across Contract Types & Allowances (0%, 5%, 10%, 15%)",
+        fontsize=15, fontweight="bold"
+    )
+    palette_allow = {0.0: "#1f77b4", 5.0: "#2ca02c", 10.0: "#ff7f0e", 15.0: "#d62728"}
 
-    # 2. Deterministic Bankable IRR vs Total IRR
-    ppa_sub = df_det[df_det["Contract_Profile"] != "Merchant_Only"]
-    sns.lineplot(data=ppa_sub, x="Allowance_Pct", y="IRR_Bankable_pct", hue="Year_Regime", style="Contract_Profile", markers=True, linewidth=2.2, ax=axs[0, 1])
-    axs[0, 1].axhline(6.5, color="black", linestyle=":", label="WACC Target (6.5%)")
-    axs[0, 1].set_title("2. Deterministic Bankable IRR (PPA Revenue Only)")
-    axs[0, 1].set_xlabel("Free Allowance Quota (%)")
-    axs[0, 1].set_ylabel("Deterministic Bankable IRR (%)")
-
-    # 3. Avoided Spot Penalties in 2020 vs 2022
-    sns.barplot(data=ppa_sub, x="Allowance_Pct", y="Annual_Avoided_Penalty_MEUR", hue="Year_Regime", palette="Set1", ax=axs[1, 0])
-    axs[1, 0].set_title("3. Annual Spot Penalties Avoided by Free Allowances (M€/yr)")
-    axs[1, 0].set_xlabel("Free Allowance Quota (%)")
-    axs[1, 0].set_ylabel("Avoided Spot Penalty (M€/yr)")
-
-    # 4. Out-of-Sample Crash Test: 2020 Contract Tested in 2022 Crisis!
-    sns.barplot(data=df_oos_crash, x="Allowance_Pct", y="Realized_Bankable_MEUR", hue="Contract_Strategy", palette=["crimson", "royalblue"], ax=axs[1, 1])
-    axs[1, 1].axhline(0, color="black", linewidth=1)
-    axs[1, 1].set_title("4. Out-of-Sample Crash Test in 2022: Naive 2020 Contract vs 2022 Oracle")
-    axs[1, 1].set_xlabel("Free Allowance Quota (%)")
-    axs[1, 1].set_ylabel("Realized 2022 Net PPA Revenue (M€/yr)")
-    axs[1, 1].legend(fontsize=8.5)
+    for r_idx, reg in enumerate(regimes):
+        for c_idx, prof in enumerate(ppa_profiles):
+            ax = axs1[r_idx, c_idx]
+            sub_s = df_shapes[(df_shapes["Year_Regime"] == reg) & (df_shapes["Contract_Profile"] == prof)]
+            for allow_val, grp in sub_s.groupby("Allowance_Pct"):
+                ax.plot(
+                    grp["Month"], grp["Baseload_MW"],
+                    marker="o", linewidth=2.2, color=palette_allow.get(allow_val, "black"),
+                    label=f"Allow {int(allow_val)}%"
+                )
+            ax.set_xticks(months)
+            ax.set_xticklabels(month_labels, rotation=30)
+            ax.set_title(f"{reg} | Profile: {prof}", fontsize=12, fontweight="bold")
+            if c_idx == 0:
+                ax.set_ylabel("Monthly Promised Baseload (MW)")
+            ax.legend(loc="upper right", fontsize=8.5)
 
     plt.tight_layout()
-    p1 = plot_dir / "01_deterministic_2020_vs_2022_overview.png"
+    p1 = plot_dir / "01_monthly_baseload_profiles_all_models.png"
     plt.savefig(p1, dpi=300, bbox_inches="tight")
     plt.close()
     print(f"Saved plot: {p1}")
 
-    # --- PLOT 2: BESS Cycling & Revenue Breakdown in Deterministic Mode ---
-    fig2, axs2 = plt.subplots(1, 2, figsize=(14, 5.5))
-    fig2.suptitle("Deterministic Battery Cycling & Revenue Split (2020 vs 2022)", fontsize=14, fontweight="bold")
-    sns.lineplot(data=ppa_sub, x="Allowance_Pct", y="Annual_BESS_Cycles", hue="Year_Regime", style="Contract_Profile", markers=True, linewidth=2.5, ax=axs2[0])
-    axs2[0].set_title("1. Annual Battery Cycling (Equivalent Full Cycles / yr)")
-    axs2[0].set_ylabel("Cycles / yr")
+    # =========================================================================
+    # PLOT 2: Bankable IRR vs Total IRR (+ Bonus) & Merchant_Only Comparison
+    # =========================================================================
+    fig2, axs2 = plt.subplots(1, 2, figsize=(16, 6), sharey=True)
+    fig2.suptitle(
+        "Deterministic IRR Analysis: Bankable IRR (Solid) vs Total IRR with Grid Bonus (Dashed) vs Merchant Only",
+        fontsize=14, fontweight="bold"
+    )
+    for r_idx, reg in enumerate(regimes):
+        ax = axs2[r_idx]
+        sub_r = df_det[df_det["Year_Regime"] == reg]
+        ppa_r = sub_r[sub_r["Contract_Profile"] != "Merchant_Only"]
+        merch_r = sub_r[sub_r["Contract_Profile"] == "Merchant_Only"]
 
-    sub10 = df_det[df_det["Allowance_Pct"].isin([0.0, 10.0]) & (df_det["Contract_Profile"] == "08h-20h")]
-    x = np.arange(len(sub10))
-    labels = [f"{r['Year_Regime']}\n({int(r['Allowance_Pct'])}% Allow)" for _, r in sub10.iterrows()]
-    axs2[1].bar(x, sub10["Bankable_PPA_Rev_MEUR"], width=0.45, label="Bankable PPA Revenue", color="royalblue")
-    axs2[1].bar(x, sub10["Merchant_Bonus_Rev_MEUR"], width=0.45, bottom=sub10["Bankable_PPA_Rev_MEUR"], label="Merchant Spot Bonus", color="darkorange")
-    axs2[1].set_xticks(x)
-    axs2[1].set_xticklabels(labels)
-    axs2[1].set_title("2. Realized Revenue Stack: Bankable PPA + Spot Bonus (08h-20h)")
-    axs2[1].set_ylabel("Annual Revenue (M€/yr)")
-    axs2[1].legend()
+        for prof, grp in ppa_r.groupby("Contract_Profile"):
+            l1 = ax.plot(grp["Allowance_Pct"], grp["IRR_Bankable_pct"], marker="o", linewidth=2.3, label=f"{prof} - Bankable IRR (PPA Only)")
+            ax.plot(
+                grp["Allowance_Pct"], grp["IRR_Total_pct"],
+                marker="s", linestyle="--", linewidth=2.3, color=l1[0].get_color(), alpha=0.8,
+                label=f"{prof} - Total IRR (+ Spot Bonus)"
+            )
+        if not merch_r.empty:
+            m_irr = merch_r["IRR_Total_pct"].iloc[0]
+            ax.axhline(m_irr, color="crimson", linestyle="-.", linewidth=2.5, label=f"Merchant_Only IRR ({m_irr:.2f}%)")
+        ax.axhline(6.5, color="black", linestyle=":", linewidth=1.8, label="WACC Target (6.5%)")
+        ax.set_title(f"IRR Performance in {reg}", fontsize=13, fontweight="bold")
+        ax.set_xlabel("Free Allowance Quota (%)")
+        if r_idx == 0:
+            ax.set_ylabel("Project IRR (%)")
+        ax.legend(fontsize=8, loc="best")
 
     plt.tight_layout()
-    p2 = plot_dir / "02_deterministic_cycling_and_revenues.png"
+    p2 = plot_dir / "02_irr_bankable_vs_total_and_merchant.png"
     plt.savefig(p2, dpi=300, bbox_inches="tight")
     plt.close()
     print(f"Saved plot: {p2}")
 
+    # =========================================================================
+    # PLOT 3: Co-Optimized BESS Sizing (Power MW, Energy MWh) & Cycling
+    # =========================================================================
+    fig3, axs3 = plt.subplots(1, 3, figsize=(18, 5.5))
+    fig3.suptitle("Co-Optimized BESS Sizing (Storage MWh, Power MW) & Annual Cycling (2020 vs 2022)", fontsize=15, fontweight="bold")
+    ppa_all = df_det[df_det["Contract_Profile"] != "Merchant_Only"]
 
-def plot_stochastic_20saa_suite(
-    df_stoch: pd.DataFrame,
-    scen_dist_dict: dict,
-    monthly_shapes_saa: dict,
-    test_name: str
-):
-    """
-    Plots for Script 2 (`stochastic_20_scenarios_saa`):
-    True Two-Stage Stochastic Analysis across S=20 SAA scenarios (P50, P90, VaR90, CVaR90).
-    """
-    plot_dir = _get_plot_dir(test_name)
-    ppa_df = df_stoch[df_stoch["Contract_Profile"] != "Merchant_Only"]
-    merch_df = df_stoch[df_stoch["Contract_Profile"] == "Merchant_Only"]
+    sns.lineplot(data=ppa_all, x="Allowance_Pct", y="Optimal_BESS_Energy_MWh", hue="Contract_Profile", style="Year_Regime", markers=True, linewidth=2.4, ax=axs3[0])
+    axs3[0].set_title("1. Optimal BESS Storage Capacity (MWh)")
+    axs3[0].set_ylabel("BESS Energy (MWh)")
 
-    # --- PLOT 1: True P50, P90, VaR90, CVaR90 Risk Fan & Tail Protection ---
-    fig, axs = plt.subplots(2, 2, figsize=(16, 11))
-    fig.suptitle("Two-Stage Stochastic Model (S = 20 SAA Scenarios): P50, P90, VaR 90 & CVaR 90", fontsize=15, fontweight="bold")
+    sns.lineplot(data=ppa_all, x="Allowance_Pct", y="Optimal_BESS_Power_MW", hue="Contract_Profile", style="Year_Regime", markers=True, linewidth=2.4, ax=axs3[1])
+    axs3[1].set_title("2. Optimal BESS Power Capacity (MW)")
+    axs3[1].set_ylabel("BESS Power (MW)")
 
-    # 1. Risk Fan Chart on 08h-20h (P50 vs P90 vs VaR90 vs CVaR90)
-    f_df = ppa_df[ppa_df["Contract_Profile"] == "08h-20h"]
-    axs[0, 0].plot(f_df["Allowance_Pct"], f_df["Annualized_P50_Bankable_MEUR"], marker="o", linewidth=2.5, color="navy", label="P50 (Median across 20 scenarios)")
-    axs[0, 0].plot(f_df["Allowance_Pct"], f_df["Annualized_P90_Bankable_MEUR"], marker="s", linewidth=2.2, color="royalblue", label="P90 (10th Percentile)")
-    axs[0, 0].plot(f_df["Allowance_Pct"], f_df["Annualized_VaR90_Bankable_MEUR"], marker="^", linestyle="--", linewidth=2, color="darkorange", label="VaR 90 (Discrete 10% Quantile)")
-    axs[0, 0].plot(f_df["Allowance_Pct"], f_df["Annualized_CVaR90_Bankable_MEUR"], marker="d", linestyle=":", linewidth=2.5, color="crimson", label="CVaR 90 (Worst 10% Tail Mean)")
-    axs[0, 0].fill_between(f_df["Allowance_Pct"], f_df["Annualized_CVaR90_Bankable_MEUR"], f_df["Annualized_P50_Bankable_MEUR"], color="royalblue", alpha=0.15, label="P50 - CVaR90 Risk Spread")
-    axs[0, 0].set_title("1. Stochastic Bankable PPA Revenue (08h-20h across 20 Scenarios)")
-    axs[0, 0].set_xlabel("Free Allowance Quota (%)")
-    axs[0, 0].set_ylabel("Annualized Bankable Revenue (M€/yr)")
-    axs[0, 0].legend(fontsize=8.5)
-
-    # 2. Full 20-Scenario Distribution Histogram (0% vs 10% Allowances on 08h-20h)
-    dist_rows = []
-    for label_k, d_map in scen_dist_dict.items():
-        sorted_vals = np.sort(list(d_map.values()))
-        for idx_s, val in enumerate(sorted_vals):
-            dist_rows.append({"Configuration": label_k, "Rank": f"S{idx_s+1:02d}", "Bankable_Rev_MEUR": val})
-    df_dist = pd.DataFrame(dist_rows)
-    sns.barplot(data=df_dist, x="Rank", y="Bankable_Rev_MEUR", hue="Configuration", palette=["indianred", "mediumseagreen"], ax=axs[0, 1])
-    axs[0, 1].axvspan(-0.5, 1.5, color="red", alpha=0.15, label="Worst 10% Tail (CVaR90 Zone: S01-S02)")
-    axs[0, 1].set_title("2. Sorted Revenue Distribution Across the 20 SAA Scenarios (S01=Worst, S20=Best)")
-    axs[0, 1].set_xlabel("Ordered SAA Scenarios (5% probability each)")
-    axs[0, 1].set_ylabel("Net Bankable PPA Revenue (M€/yr)")
-    axs[0, 1].tick_params(axis="x", rotation=45)
-    axs[0, 1].legend(fontsize=8)
-
-    # 3. Seasonal Stage-1 Baseload Commitment B_m (Here-and-Now across 20 scenarios)
-    months = np.arange(1, 13)
-    month_labels = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-    for label, s_dict in monthly_shapes_saa.items():
-        axs[1, 0].plot(months, [s_dict[m] for m in months], marker="o", linewidth=2.2, label=label)
-    axs[1, 0].set_xticks(months)
-    axs[1, 0].set_xticklabels(month_labels)
-    axs[1, 0].set_title("3. Stage-1 Robust Monthly Baseload Commitment B_m (MW)")
-    axs[1, 0].set_ylabel("Here-and-Now Baseload B_m (MW)")
-    axs[1, 0].legend(fontsize=8.5)
-
-    # 4. Bankable IRR (at P90) vs Total IRR (at P90) + Merchant_Only Benchmark
-    for prof, grp in ppa_df.groupby("Contract_Profile"):
-        l1 = axs[1, 1].plot(grp["Allowance_Pct"], grp["IRR_Bankable_pct"], marker="o", linewidth=2.2, label=f"{prof} (Bankable P90 IRR)")
-        axs[1, 1].plot(grp["Allowance_Pct"], grp["IRR_Total_pct"], marker="s", linestyle="--", color=l1[0].get_color(), linewidth=2.2, label=f"{prof} (Total P90 IRR + Spot)")
-    if not merch_df.empty:
-        m_irr = merch_df["IRR_Total_pct"].iloc[0]
-        axs[1, 1].axhline(m_irr, color="darkorange", linestyle="-.", linewidth=2, label=f"Merchant_Only P90 IRR ({m_irr:.2f}%)")
-    axs[1, 1].axhline(6.5, color="black", linestyle=":", label="WACC (6.5%)")
-    axs[1, 1].set_title("4. Bankable P90 IRR vs Total P90 IRR Across Profiles")
-    axs[1, 1].set_xlabel("Allowance Quota (%)")
-    axs[1, 1].set_ylabel("P90 Project IRR (%)")
-    axs[1, 1].legend(fontsize=8)
+    sns.lineplot(data=ppa_all, x="Allowance_Pct", y="Annual_BESS_Cycles", hue="Contract_Profile", style="Year_Regime", markers=True, linewidth=2.4, ax=axs3[2])
+    axs3[2].set_title("3. Annual Battery Cycling (Equivalent Full Cycles/yr)")
+    axs3[2].set_ylabel("Cycles / yr")
 
     plt.tight_layout()
-    p1 = plot_dir / "01_stochastic_20saa_risk_and_distribution.png"
-    plt.savefig(p1, dpi=300, bbox_inches="tight")
+    p3 = plot_dir / "03_optimal_bess_sizing_and_cycling.png"
+    plt.savefig(p3, dpi=300, bbox_inches="tight")
     plt.close()
-    print(f"Saved plot: {p1}")
+    print(f"Saved plot: {p3}")
 
-    # --- PLOT 2: Penalties Avoided, Excess Shortfall & BESS Cycling Across 20 Scenarios ---
-    fig2, axs2 = plt.subplots(1, 3, figsize=(18, 5.5))
-    fig2.suptitle("Two-Stage Stochastic (20 SAA Scenarios): Penalty Protection & Battery Cycling", fontsize=15, fontweight="bold")
+    # =========================================================================
+    # PLOT 4: Cross-Scenario Out-of-Sample Matrix (2020->2022 and 2022->2020)
+    # =========================================================================
+    fig4, axs4 = plt.subplots(2, 2, figsize=(17, 11))
+    fig4.suptitle(
+        "Out-of-Sample Cross-Evaluation: 2020 Designs Tested in 2022 Crisis vs 2022 Designs Tested in 2020",
+        fontsize=15, fontweight="bold"
+    )
 
-    sns.lineplot(data=ppa_df, x="Allowance_Pct", y="Annual_Avoided_Penalty_MEUR", hue="Contract_Profile", marker="o", linewidth=2.5, ax=axs2[0])
-    axs2[0].set_title("1. Expected Spot Penalties Avoided by Allowances (M€/yr)")
-    axs2[0].set_ylabel("Avoided Spot Penalty (M€/yr)")
+    c_20_in_22 = df_cross[(df_cross["Evaluation_Direction"] == "Trained_2020_Tested_in_2022") & (df_cross["Contract_Profile"] != "Merchant_Only")]
+    c_22_in_20 = df_cross[(df_cross["Evaluation_Direction"] == "Trained_2022_Tested_in_2020") & (df_cross["Contract_Profile"] != "Merchant_Only")]
 
-    sns.lineplot(data=ppa_df, x="Allowance_Pct", y="Annual_Expected_Penalty_MEUR", hue="Contract_Profile", marker="s", linewidth=2.5, ax=axs2[1])
-    axs2[1].set_title("2. Residual Excess Shortfall Penalty Paid (M€/yr)")
-    axs2[1].set_ylabel("Residual Paid Penalty (M€/yr)")
+    # Panel A: 2020 Model tested in 2022 - Bankable Revenue (In-Sample Oracle vs Out-of-Sample)
+    sns.barplot(data=c_20_in_22, x="Allowance_Pct", y="OOS_Bankable_PPA_Rev_MEUR", hue="Contract_Profile", palette="Reds_d", ax=axs4[0, 0])
+    axs4[0, 0].axhline(0, color="black", linewidth=1)
+    axs4[0, 0].set_title("1. [2020 Model -> Tested in 2022] Realized Net PPA Revenue (M€/yr)")
+    axs4[0, 0].set_ylabel("Net PPA Revenue in 2022 (M€/yr)")
 
-    sns.lineplot(data=ppa_df, x="Allowance_Pct", y="Annual_BESS_Cycles", hue="Contract_Profile", marker="^", linewidth=2.5, ax=axs2[2])
-    if not merch_df.empty:
-        axs2[2].axhline(merch_df["Annual_BESS_Cycles"].iloc[0], color="darkorange", linestyle="--", label="Merchant_Only Cycles")
-    axs2[2].set_title("3. Expected Annual Battery Cycling (EFC / yr)")
-    axs2[2].set_ylabel("Equivalent Full Cycles / yr")
-    axs2[2].legend()
+    # Panel B: 2020 Model tested in 2022 - Total IRR vs Native 2022 Oracle IRR
+    for prof, grp in c_20_in_22.groupby("Contract_Profile"):
+        l = axs4[0, 1].plot(grp["Allowance_Pct"], grp["OOS_IRR_Total_pct"], marker="o", linewidth=2.3, label=f"{prof} (2020 Design in 2022)")
+        axs4[0, 1].plot(grp["Allowance_Pct"], grp["Native_Oracle_IRR_Total_pct"], marker="s", linestyle="--", color=l[0].get_color(), alpha=0.75, label=f"{prof} (2022 Native Oracle)")
+    axs4[0, 1].axhline(6.5, color="black", linestyle=":", label="WACC (6.5%)")
+    axs4[0, 1].set_title("2. [2020 Model -> Tested in 2022] Total IRR vs 2022 Oracle IRR (%)")
+    axs4[0, 1].set_ylabel("Total IRR in 2022 (%)")
+    axs4[0, 1].legend(fontsize=8)
+
+    # Panel C: 2022 Model tested in 2020 - Realized Net PPA Revenue
+    sns.barplot(data=c_22_in_20, x="Allowance_Pct", y="OOS_Bankable_PPA_Rev_MEUR", hue="Contract_Profile", palette="Blues_d", ax=axs4[1, 0])
+    axs4[1, 0].axhline(0, color="black", linewidth=1)
+    axs4[1, 0].set_title("3. [2022 Model -> Tested in 2020] Realized Net PPA Revenue (M€/yr)")
+    axs4[1, 0].set_ylabel("Net PPA Revenue in 2020 (M€/yr)")
+
+    # Panel D: 2022 Model tested in 2020 - Total IRR vs Native 2020 Oracle IRR
+    for prof, grp in c_22_in_20.groupby("Contract_Profile"):
+        l = axs4[1, 1].plot(grp["Allowance_Pct"], grp["OOS_IRR_Total_pct"], marker="o", linewidth=2.3, label=f"{prof} (2022 Design in 2020)")
+        axs4[1, 1].plot(grp["Allowance_Pct"], grp["Native_Oracle_IRR_Total_pct"], marker="s", linestyle="--", color=l[0].get_color(), alpha=0.75, label=f"{prof} (2020 Native Oracle)")
+    axs4[1, 1].axhline(6.5, color="black", linestyle=":", label="WACC (6.5%)")
+    axs4[1, 1].set_title("4. [2022 Model -> Tested in 2020] Total IRR vs 2020 Oracle IRR (%)")
+    axs4[1, 1].set_ylabel("Total IRR in 2020 (%)")
+    axs4[1, 1].legend(fontsize=8)
 
     plt.tight_layout()
-    p2 = plot_dir / "02_stochastic_20saa_penalties_and_cycling.png"
-    plt.savefig(p2, dpi=300, bbox_inches="tight")
+    p4 = plot_dir / "04_cross_scenario_out_of_sample_matrix.png"
+    plt.savefig(p4, dpi=300, bbox_inches="tight")
     plt.close()
-    print(f"Saved plot: {p2}")
+    print(f"Saved plot: {p4}")

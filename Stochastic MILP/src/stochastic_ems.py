@@ -506,3 +506,205 @@ def solve_annual_monthly_baseload_52w(
         "Scenario_Total_MEUR": {w: v / 1e6 for w, v in total_revs.items()},
         "Hourly_Results_8760h": full_year_hourly,
     }
+
+def solve_full_year_8760h_coopt(
+    df_year: pd.DataFrame,
+    cfg: dict,
+    allowance_pct: float = 0.10,
+    contract_profile: str = "08h-20h",
+    optimize_bess_size: bool = True,
+    fixed_bess_power_mw: float = None,
+    fixed_bess_energy_mwh: float = None,
+    fixed_monthly_baseloads: dict = None,  # Dict {1: MW, ..., 12: MW} for Out-of-Sample cross-testing
+    penalty_mode_override: str = None,
+    solver_name: str = "appsi_highs"
+) -> dict:
+    """
+    Full-Year (8760h) Deterministic Co-Optimization & Out-of-Sample Evaluator:
+    - Co-optimizes a SINGLE annual BESS size (Power MW & Energy MWh) + 12 Monthly Baseload commitments B_m (m=1..12)
+      across all 8760 hours simultaneously with continuous SoC dynamics.
+    - When `fixed_bess_power_mw`, `fixed_bess_energy_mwh`, and `fixed_monthly_baseloads` are provided,
+      evaluates that exact pre-sized system & contract on the opposite year (2020 -> 2022 or 2022 -> 2020).
+    """
+    df = df_year.iloc[:8760].reset_index(drop=True)
+    T = len(df)
+    crf = compute_crf(cfg["project"]["wacc_real"], cfg["project"]["lifetime_years"])
+
+    is_merchant_only = (contract_profile == "Merchant_Only")
+    active_mask = get_contract_window_mask(T, contract_profile)
+    months_arr = df["month"].values
+    pv_arr = df["pv_mw"].values.astype(float)
+    price_arr = df["price_da"].values.astype(float)
+
+    ppa_price = 0.0 if is_merchant_only else float(cfg["ppa_contract"]["base_firm_ppa_price_eur_mwh"])
+    pen_mode = penalty_mode_override or cfg["ppa_contract"].get("excess_penalty_mode", "spot_price")
+    poi_max = float(cfg["project"]["grid_poi_max_mw"])
+    tight_max_bl = 65.0 if contract_profile != "18h-20h" else poi_max
+
+    # Pre-group active & inactive hours per month m = 1..12
+    month_active_hours = {}
+    month_allow_hours = {}
+    for m_idx in range(1, 13):
+        act_h = [int(t) for t in range(T) if (months_arr[t] == m_idx and active_mask[t])]
+        month_active_hours[m_idx] = act_h
+        month_allow_hours[m_idx] = int(np.floor(allowance_pct * len(act_h))) if not is_merchant_only else 0
+
+    active_hours_all = [int(t) for t in range(T) if active_mask[t]]
+    inactive_hours_all = [int(t) for t in range(T) if not active_mask[t]]
+
+    m = pyo.ConcreteModel(name="FullYear_8760h_CoOpt")
+    m.T = pyo.RangeSet(0, T - 1)
+    m.M = pyo.RangeSet(1, 12)
+    m.T_active = pyo.Set(initialize=active_hours_all)
+    m.T_inactive = pyo.Set(initialize=inactive_hours_all)
+
+    # 1. ANNUAL BESS SIZING VARIABLES (OR FIXED FROM OPPOSITE YEAR)
+    if fixed_bess_power_mw is not None and fixed_bess_energy_mwh is not None:
+        m.bess_p_max = pyo.Param(initialize=float(fixed_bess_power_mw))
+        m.bess_e_max = pyo.Param(initialize=float(fixed_bess_energy_mwh))
+    elif optimize_bess_size:
+        m.bess_p_max = pyo.Var(bounds=(0.0, poi_max))
+        m.bess_e_max = pyo.Var(bounds=(0.0, 4.0 * poi_max))
+    else:
+        m.bess_p_max = pyo.Param(initialize=float(cfg["bess_default"]["power_mw"]))
+        m.bess_e_max = pyo.Param(initialize=float(cfg["bess_default"]["energy_mwh"]))
+
+    # 2. MONTHLY BASELOAD VARIABLES B_m (m = 1..12)
+    if is_merchant_only:
+        m.B_month = pyo.Param(m.M, initialize=0.0)
+    elif fixed_monthly_baseloads is not None:
+        m.B_month = pyo.Param(m.M, initialize={k: float(v) for k, v in fixed_monthly_baseloads.items()})
+    else:
+        m.B_month = pyo.Var(m.M, bounds=(0.0, tight_max_bl))
+
+    # 3. HOURLY DISPATCH VARIABLES Across 8760h
+    m.pv_to_grid = pyo.Var(m.T, domain=pyo.NonNegativeReals)
+    m.pv_to_bess = pyo.Var(m.T, domain=pyo.NonNegativeReals)
+    m.bess_to_grid = pyo.Var(m.T, domain=pyo.NonNegativeReals)
+    m.soc = pyo.Var(m.T, domain=pyo.NonNegativeReals)
+
+    m.q_ppa_deliv = pyo.Var(m.T, domain=pyo.NonNegativeReals)
+    m.q_allow_free = pyo.Var(m.T, domain=pyo.NonNegativeReals)
+    m.q_excess_shortfall = pyo.Var(m.T, domain=pyo.NonNegativeReals)
+    m.q_merchant_bonus = pyo.Var(m.T, domain=pyo.NonNegativeReals)
+
+    # 4. PHYSICAL & CONTRACTUAL CONSTRAINTS
+    eta_ch = float(cfg["bess_default"]["eta_charge"])
+    eta_dis = float(cfg["bess_default"]["eta_discharge"])
+    soc_min = float(cfg["bess_default"]["soc_min_pct"])
+    soc_max = float(cfg["bess_default"]["soc_max_pct"])
+
+    m.c_pv = pyo.Constraint(m.T, rule=lambda m, t: m.pv_to_grid[t] + m.pv_to_bess[t] <= pv_arr[t])
+    m.c_ch_p = pyo.Constraint(m.T, rule=lambda m, t: m.pv_to_bess[t] <= m.bess_p_max)
+    m.c_dis_p = pyo.Constraint(m.T, rule=lambda m, t: m.bess_to_grid[t] <= m.bess_p_max)
+    m.c_soc_min = pyo.Constraint(m.T, rule=lambda m, t: m.soc[t] >= soc_min * m.bess_e_max)
+    m.c_soc_max = pyo.Constraint(m.T, rule=lambda m, t: m.soc[t] <= soc_max * m.bess_e_max)
+
+    def soc_dyn_rule(m, t):
+        soc_prev = 0.50 * m.bess_e_max if t == 0 else m.soc[t - 1]
+        return m.soc[t] == soc_prev + eta_ch * m.pv_to_bess[t] - (1.0 / eta_dis) * m.bess_to_grid[t]
+    m.c_soc_dyn = pyo.Constraint(m.T, rule=soc_dyn_rule)
+    m.c_soc_cyclic = pyo.Constraint(rule=lambda m: m.soc[T - 1] >= 0.50 * m.bess_e_max)
+
+    m.c_poi = pyo.Constraint(m.T, rule=lambda m, t: m.pv_to_grid[t] + m.bess_to_grid[t] <= poi_max)
+    m.c_export_split = pyo.Constraint(
+        m.T, rule=lambda m, t: m.pv_to_grid[t] + m.bess_to_grid[t] == m.q_ppa_deliv[t] + m.q_merchant_bonus[t]
+    )
+
+    if len(active_hours_all) > 0:
+        m.c_active_target = pyo.Constraint(
+            m.T_active,
+            rule=lambda m, t: m.q_ppa_deliv[t] + m.q_allow_free[t] + m.q_excess_shortfall[t] == m.B_month[int(months_arr[t])]
+        )
+        m.c_free_ub = pyo.Constraint(
+            m.T_active,
+            rule=lambda m, t: m.q_allow_free[t] <= m.B_month[int(months_arr[t])]
+        )
+        m.c_monthly_allow_bank = pyo.Constraint(
+            m.M,
+            rule=lambda m, m_idx: (
+                sum(m.q_allow_free[t] for t in month_active_hours[m_idx]) <= month_allow_hours[m_idx] * m.B_month[m_idx]
+                if len(month_active_hours[m_idx]) > 0 else pyo.Constraint.Skip
+            )
+        )
+
+    if len(inactive_hours_all) > 0:
+        m.c_inact_deliv = pyo.Constraint(m.T_inactive, rule=lambda m, t: m.q_ppa_deliv[t] == 0.0)
+        m.c_inact_free = pyo.Constraint(m.T_inactive, rule=lambda m, t: m.q_allow_free[t] == 0.0)
+        m.c_inact_exc = pyo.Constraint(m.T_inactive, rule=lambda m, t: m.q_excess_shortfall[t] == 0.0)
+
+    # 5. ANNUAL REVENUES, BESS CAPEX ANNUALIZATION & OBJECTIVE
+    deg_cost = float(cfg["bess_default"]["degradation_cost_eur_mwh"])
+    bess_annualized_cost = (
+        m.bess_p_max * (crf * cfg["capex_opex"]["bess_power_capex_eur_per_mw"] + cfg["capex_opex"]["bess_opex_eur_per_mw_yr"])
+        + m.bess_e_max * (crf * cfg["capex_opex"]["bess_energy_capex_eur_per_mwh"])
+    )
+
+    pen_rates = [compute_excess_shortfall_penalty_rate(price_arr[t], ppa_price, pen_mode) for t in range(T)]
+    pos_prices = [max(0.0, price_arr[t]) for t in range(T)]
+
+    if is_merchant_only:
+        m.bankable_ppa_rev = pyo.Expression(expr=0.0)
+        m.merchant_bonus_rev = pyo.Expression(
+            expr=sum(m.q_merchant_bonus[t] * pos_prices[t] - deg_cost * m.bess_to_grid[t] for t in m.T)
+        )
+        m.obj = pyo.Objective(expr=m.merchant_bonus_rev - bess_annualized_cost, sense=pyo.maximize)
+    else:
+        m.bankable_ppa_rev = pyo.Expression(
+            expr=sum(
+                m.q_ppa_deliv[t] * ppa_price
+                - m.q_excess_shortfall[t] * pen_rates[t]
+                - deg_cost * m.bess_to_grid[t]
+                - 0.01 * m.q_allow_free[t]
+                for t in m.T
+            )
+        )
+        m.merchant_bonus_rev = pyo.Expression(
+            expr=sum(m.q_merchant_bonus[t] * pos_prices[t] for t in m.T)
+        )
+        w_merch = float(cfg["ppa_contract"]["merchant_bonus_weight"])
+        # Prioritize Bankable Net PPA Profit + secondary weight on Merchant Grid Bonus
+        m.obj = pyo.Objective(
+            expr=(m.bankable_ppa_rev - bess_annualized_cost) + w_merch * m.merchant_bonus_rev,
+            sense=pyo.maximize
+        )
+
+    solver = pyo.SolverFactory(solver_name)
+    solver.solve(m, load_solutions=True)
+
+    bess_p_val = float(pyo.value(m.bess_p_max))
+    bess_e_val = float(pyo.value(m.bess_e_max))
+    monthly_bl_dict = {m_idx: float(pyo.value(m.B_month[m_idx])) for m_idx in range(1, 13)}
+
+    free_vec = np.array([float(pyo.value(m.q_allow_free[t])) for t in m.T])
+    exc_vec = np.array([float(pyo.value(m.q_excess_shortfall[t])) for t in m.T])
+    bess_dis_vec = np.array([float(pyo.value(m.bess_to_grid[t])) for t in m.T])
+    pen_rates_arr = np.array(pen_rates)
+
+    tot_dis_mwh = float(bess_dis_vec.sum())
+    annual_cycles = (tot_dis_mwh / bess_e_val) if bess_e_val > 0.1 else 0.0
+
+    bank_rev_eur = float(pyo.value(m.bankable_ppa_rev))
+    merch_rev_eur = float(pyo.value(m.merchant_bonus_rev))
+
+    return {
+        "Contract_Profile": contract_profile,
+        "Allowance_Pct": allowance_pct * 100.0,
+        "Annual_Allowance_Hours": sum(month_allow_hours.values()),
+        "Mean_Annual_Baseload_MW": float(np.mean(list(monthly_bl_dict.values()))),
+        "Min_Winter_Baseload_MW": float(min(monthly_bl_dict.values())),
+        "Max_Summer_Baseload_MW": float(max(monthly_bl_dict.values())),
+        "Monthly_Baseload_Profile_MW": monthly_bl_dict,
+        "Optimal_BESS_Power_MW": bess_p_val,
+        "Optimal_BESS_Energy_MWh": bess_e_val,
+        "Annual_BESS_Cycles": annual_cycles,
+        "Annual_BESS_Discharged_MWh": tot_dis_mwh,
+        "Annual_Degradation_Cost_MEUR": (tot_dis_mwh * deg_cost) / 1e6,
+        "Annual_Free_Allowance_MWh": float(free_vec.sum()),
+        "Annual_Excess_Shortfall_MWh": float(exc_vec.sum()),
+        "Annual_Paid_Penalty_MEUR": float((exc_vec * pen_rates_arr).sum()) / 1e6,
+        "Annual_Avoided_Penalty_MEUR": float((free_vec * pen_rates_arr).sum()) / 1e6,
+        "Realized_Bankable_MEUR": bank_rev_eur / 1e6,
+        "Realized_Merchant_MEUR": merch_rev_eur / 1e6,
+        "Realized_Total_MEUR": (bank_rev_eur + merch_rev_eur) / 1e6,
+    }
