@@ -1,0 +1,31 @@
+project:
+  pv_capacity_mwp: 100.0
+  grid_poi_max_mw: 100.0
+  lifetime_years: 25
+  wacc_real: 0.065
+  tax_rate: 0.22
+
+bess_default:
+  power_mw: 50.0
+  energy_mwh: 100.0
+  eta_charge: 0.925
+  eta_discharge: 0.925
+  soc_min_pct: 0.10
+  soc_max_pct: 0.90
+  degradation_cost_eur_mwh: 10.0
+
+capex_opex:
+  pv_capex_eur_per_mw: 550000.0
+  pv_opex_eur_per_mw_yr: 11000.0
+  bess_power_capex_eur_per_mw: 120000.0
+  bess_energy_capex_eur_per_mwh: 160000.0
+  bess_opex_eur_per_mw_yr: 8000.0
+
+ppa_contract:
+  base_firm_ppa_price_eur_mwh: 75.0     # Fixed PPA price across all allowance levels
+  cvar_alpha: 0.90
+  risk_aversion_lambda: 0.60            # Weight on P90/CVaR vs P50
+  merchant_bonus_weight: 0.15
+  # Penalty mode applied ONLY to excess shortfall beyond the free allowance quota:
+  # Options: "spot_price", "min_spot_ppa", "max_spot_ppa"
+  excess_penalty_mode: "spot_price"
